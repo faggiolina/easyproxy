@@ -1,15 +1,15 @@
-# fly.toml app configuration file generated for easynew on 2026-04-10T13:56:43Z
+# fly.toml app configuration file generated for easyproxy-8000 on 2026-04-12T13:44:48Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'easynew'
+app = 'easyproxy-8000'
 primary_region = 'ams'
 
 [build]
 
 [http_service]
-  internal_port = 7860
+  internal_port = 8000
   force_https = true
   auto_stop_machines = 'stop'
   auto_start_machines = true
