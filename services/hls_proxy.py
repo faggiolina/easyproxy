@@ -813,10 +813,12 @@ class HLSProxy:
                         request_headers, proxies=proxy_list
                     )
                 return self.extractors[key]
-            elif "popcdn.day" in url:
+            elif "popcdn.day" in url or "freeshot.live" in url:
                 key = "freeshot"
                 proxy = get_proxy_for_url(
-                    "popcdn.day", TRANSPORT_ROUTES, GLOBAL_PROXIES
+                    "popcdn.day" if "popcdn.day" in url else "freeshot.live", 
+                    TRANSPORT_ROUTES, 
+                    GLOBAL_PROXIES
                 )
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
