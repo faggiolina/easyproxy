@@ -1,7 +1,7 @@
 # Dockerfile.light - Versione leggera senza FlareSolverr/Byparr integrati
 # Ideale per uso con Docker Compose o solver esterni.
 
-FROM python:3.12-bookworm
+FROM python:3.12-slim-bookworm
 
 # Imposta la directory di lavoro all'interno del container.
 WORKDIR /app
@@ -15,9 +15,8 @@ ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=0
 ENV PYTHONUNBUFFERED=1
 
 # Installa FFmpeg e Chromium di sistema (importante per molti extractor).
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    xvfb \
     chromium \
     libnss3 \
     libatk1.0-0 \
@@ -57,4 +56,4 @@ LABEL org.opencontainers.image.description="Server proxy universale per stream H
 EXPOSE 7860
 
 # Comando per avviare l'app
-CMD ["sh", "-c", "WORKERS_COUNT=${WORKERS:-$(nproc 2>/dev/null || echo 1)}; xvfb-run -a --server-args='-screen 0 1366x768x24' gunicorn --bind 0.0.0.0:${PORT:-7860} --workers $WORKERS_COUNT --worker-class aiohttp.worker.GunicornWebWorker --timeout 120 --graceful-timeout 120 app:app"]
+CMD ["sh", "-c", "WORKERS_COUNT=${WORKERS:-$(nproc 2>/dev/null || echo 1)}; gunicorn --bind 0.0.0.0:${PORT:-7860} --workers $WORKERS_COUNT --worker-class aiohttp.worker.GunicornWebWorker --timeout 120 --graceful-timeout 120 app:app"]

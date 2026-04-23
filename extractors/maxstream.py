@@ -8,7 +8,9 @@ from aiohttp import ClientSession, ClientTimeout, TCPConnector
 from aiohttp.resolver import DefaultResolver
 from aiohttp_socks import ProxyConnector
 from bs4 import BeautifulSoup
-from config import GLOBAL_PROXIES, TRANSPORT_ROUTES, get_proxy_for_url
+from config import GLOBAL_PROXIES, TRANSPORT_ROUTES, get_proxy_for_url, get_connector_for_proxy
+
+from utils.smart_request import smart_request
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +86,7 @@ class MaxstreamExtractor:
         
         timeout = ClientTimeout(total=45, connect=15, sock_read=30)
         if proxy:
-            connector = ProxyConnector.from_url(proxy)
+            connector = get_connector_for_proxy(proxy)
             return ClientSession(timeout=timeout, connector=connector, headers=self.base_headers)
         
         if self.session is None or self.session.closed:
@@ -109,7 +111,7 @@ class MaxstreamExtractor:
                         data = await resp.json()
                         ips = [ans['data'] for ans in data.get('Answer', []) if ans.get('type') == 1]
                         if ips:
-                            logger.info(f"DoH resolved {domain} to {ips}")
+                            logger.debug(f"DoH resolved {domain} to {ips}")
                             return ips
         except Exception as e:
             logger.debug(f"DoH resolution failed for {domain}: {e}")
@@ -152,7 +154,7 @@ class MaxstreamExtractor:
                     await self.session.close()
                     self.session = None
                 self.resolver.mapping[domain] = use_ip
-                logger.info(f"DoH bypass: forcing {domain} -> {use_ip}")
+                logger.debug(f"DoH bypass: forcing {domain} -> {use_ip}")
             else:
                 self.resolver.mapping.pop(domain, None)
 
@@ -165,8 +167,25 @@ class MaxstreamExtractor:
                             if proxy: await session.close()
                             return content
                         text = await response.text()
+                        
+                        # Check for Cloudflare challenge in successful response
+                        if any(marker in text.lower() for marker in ["cf-challenge", "ray id", "checking your browser"]):
+                            logger.warning(f"Cloudflare detected on {url} (Proxy: {proxy}), trying FlareSolverr fallback...")
+                            # Fallback to the global smart_request utility
+                            if proxy: await session.close()
+                            fs_cmd = f"request.{method.lower()}"
+                            result = await smart_request(fs_cmd, url, headers=kwargs.get("headers"), post_data=kwargs.get("data"), proxies=self.proxies)
+                            return result.get("html", "") if isinstance(result, dict) else result
+
                         if proxy: await session.close()
                         return text
+                    elif response.status in (403, 503):
+                        # Might be Cloudflare block, try FlareSolverr immediately for this path
+                        logger.warning(f"HTTP {response.status} on {url}, checking with FlareSolverr...")
+                        if proxy: await session.close()
+                        fs_cmd = f"request.{method.lower()}"
+                        result = await smart_request(fs_cmd, url, headers=kwargs.get("headers"), post_data=kwargs.get("data"), proxies=self.proxies)
+                        return result.get("html", "") if isinstance(result, dict) else result
                     else:
                         logger.warning(f"Request to {url} failed (Status {response.status}) [Proxy: {proxy}, StaticIP: {use_ip}]")
             except Exception as e:
@@ -202,7 +221,7 @@ class MaxstreamExtractor:
             parsed = urlparse(original_url)
             captcha_url = f"{parsed.scheme}://{parsed.netloc}{captcha_url}"
             
-        logger.info(f"Downloading captcha from: {captcha_url}")
+        logger.debug(f"Downloading captcha from: {captcha_url}")
         img_data = await self._smart_request(captcha_url, is_binary=True)
         
         if not img_data:
@@ -214,7 +233,7 @@ class MaxstreamExtractor:
             
         # Solve
         res = self._ocr_engine.classification(img_data)
-        logger.info(f"Captcha solved: {res}")
+        logger.debug(f"Captcha solved: {res}")
         
         # Submit form
         form_action = form.get("action", "")
@@ -238,7 +257,7 @@ class MaxstreamExtractor:
             if hidden.get("name"):
                 post_data[hidden["name"]] = hidden.get("value", "")
         
-        logger.info(f"Submitting captcha to: {form_action}")
+        logger.debug(f"Submitting captcha to: {form_action}")
         headers = {**self.base_headers, "referer": original_url}
         solved_text = await self._smart_request(form_action, method="POST", data=post_data, headers=headers)
         
@@ -306,7 +325,7 @@ class MaxstreamExtractor:
             return res
             
         # 2. If no link, try puzzle/captcha solver
-        logger.info("Direct link not found, checking for captcha...")
+        logger.debug("Direct link not found, checking for captcha...")
         res = await self._solve_uprot_captcha(text, link)
         if res:
             return res
@@ -321,7 +340,7 @@ class MaxstreamExtractor:
     async def extract(self, url: str, **kwargs) -> dict:
         """Extract Maxstream URL."""
         maxstream_url = await self.get_uprot(url)
-        logger.info(f"Target URL: {maxstream_url}")
+        logger.debug(f"Target URL: {maxstream_url}")
         
         # Use strict headers to avoid Error 131
         headers = {

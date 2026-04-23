@@ -1,9 +1,10 @@
 import asyncio
 import logging
+import random
 import re
 import sys
-import random
 import os
+import time
 import socket
 import urllib.parse
 from urllib.parse import urlparse, urljoin
@@ -13,7 +14,7 @@ import hashlib
 import hmac
 import json
 import ssl
-import time
+import yarl
 import aiohttp
 from aiohttp import (
     web,
@@ -38,17 +39,27 @@ from config import (
     TRANSPORT_ROUTES,
     get_proxy_for_url,
     get_ssl_setting_for_url,
+    get_connector_for_proxy,
     API_PASSWORD,
     check_password,
     MPD_MODE,
+    VERSION_MODE,
+    APP_VERSION,
+    ENABLE_WARP,
+    ENABLE_REMUXING,
+    WARP_EXCLUDE_DOMAINS,
+    WARP_PROXY_URL,
 )
 from extractors.generic import GenericHLSExtractor, ExtractorError
 from services.manifest_rewriter import ManifestRewriter
 
-# Legacy MPD converter (used when MPD_MODE=legacy)
+# Global registry for domains already bypassed in WARP to avoid redundant os.system calls
+BYPASSED_WARP_DOMAINS = set()
+
+# Legacy MPD converter (used when MPD_MODE is not ffmpeg)
 MPDToHLSConverter = None
 decrypt_segment = None
-if MPD_MODE == "legacy":
+if MPD_MODE in ("legacy", "none", "disabled"):
     try:
         from utils.mpd_converter import MPDToHLSConverter
         from utils.drm_decrypter import decrypt_segment
@@ -294,9 +305,9 @@ except ImportError:
 
 try:
     from extractors.cinemacity import CinemaCityExtractor
-    print("✅ CinemaCityExtractor loaded successfully")
+    logger.info("✅ CinemaCityExtractor module loaded.")
 except Exception as e:
-    print(f"❌ CinemaCityExtractor FAILED to load: {e}")
+    logger.warning("⚠️ CinemaCityExtractor module not found or failed to load: %s", e)
     CinemaCityExtractor = None
 
 try:
@@ -334,9 +345,119 @@ class HLSProxy:
         self.session = None
         self.flex_session = None
 
+        # Registry for HLS URL shortening (to handle extremely long multi-path URLs)
+        # url_id -> (actual_url, timestamp, ttl)
+        self.hls_url_map = {}
+        self.hls_url_ttl = 3600
+        self.hls_url_ttl_cinemacity = 10800
+        self.hls_url_max_entries = 2000
+        
         # Cache for proxy sessions (proxy_url -> session)
         # This reuses connections for the same proxy to improve performance
         self.proxy_sessions = {}
+        self.curl_sessions = {}  # Registry for pooled curl_cffi sessions
+
+        # Version information
+        self.latest_version = "Checking..."
+        self.warp_status = "Disabled" if not ENABLE_WARP else "Checking..."
+
+        # Version information
+        self.latest_version = "Checking..."
+
+    async def shorten_hls_url(self, url: str) -> str:
+        """Crea un ID breve per un URL e lo memorizza nella mappa."""
+        if not url:
+            return ""
+        now = time.time()
+        current_ttl = (
+            self.hls_url_ttl_cinemacity
+            if "cinemacity.cc" in url.lower() or "cccdn.net" in url.lower()
+            else self.hls_url_ttl
+        )
+        expired_keys = [
+            key for key, (_, ts, ttl) in self.hls_url_map.items()
+            if now - ts > ttl
+        ]
+        for key in expired_keys:
+            self.hls_url_map.pop(key, None)
+
+        if len(self.hls_url_map) >= self.hls_url_max_entries:
+            oldest_keys = sorted(
+                self.hls_url_map.items(),
+                key=lambda item: item[1][1]
+            )[: max(1, len(self.hls_url_map) - self.hls_url_max_entries + 1)]
+            for key, _ in oldest_keys:
+                self.hls_url_map.pop(key, None)
+
+        # Usa un hash corto (12 caratteri) per l'URL
+        url_id = f"u_{hashlib.md5(url.encode()).hexdigest()[:12]}"
+        self.hls_url_map[url_id] = (url, now, current_ttl)
+        return url_id
+
+    async def start_tasks(self):
+        """Starts background tasks for the proxy."""
+        asyncio.create_task(self._update_latest_version())
+        # Always start WARP check (universal trace method)
+        asyncio.create_task(self._update_warp_status_loop())
+
+    async def _update_warp_status_loop(self):
+        """Periodically checks WARP status via Cloudflare trace (Universal)."""
+        while True:
+            try:
+                # We use the proxy session to check if the SOCKS5H proxy is working
+                session, _ = await self._get_proxy_session("https://www.cloudflare.com/cdn-cgi/trace")
+                async with session.get("https://www.cloudflare.com/cdn-cgi/trace", timeout=5) as resp:
+                    if resp.status == 200:
+                        text = await resp.text()
+                        if "warp=on" in text:
+                            self.warp_status = "Connected"
+                        else:
+                            self.warp_status = "Disconnected"
+                    else:
+                        self.warp_status = "Error"
+            except Exception:
+                self.warp_status = "Disconnected"
+            
+            await asyncio.sleep(60) # Check every minute
+
+    async def _update_latest_version(self):
+        """Periodically checks GitHub for the latest version in the background."""
+        while True:
+            await self._refresh_latest_version()
+            # Check every hour in background
+            await asyncio.sleep(3600)
+
+    async def _refresh_latest_version(self):
+        """Checks GitHub config.py for the latest version with cache busting.
+        Can be called on-demand (e.g. on page refresh).
+        """
+        try:
+            # Use a timestamp to bypass GitHub's cache
+            cache_buster = int(time.time())
+            url = f"https://raw.githubusercontent.com/realbestia1/EasyProxy/main/config.py?t={cache_buster}"
+            
+            # Use a direct session with a short timeout to not block UI too long
+            session = await self._get_session()
+            async with session.get(url, timeout=2) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    # Use regex to find APP_VERSION = "..." or '...'
+                    match = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', text)
+                    if match:
+                        new_version = match.group(1)
+                        if self.latest_version != new_version:
+                            self.latest_version = new_version
+                            logger.info(f"🆕 Latest version updated: {self.latest_version}")
+                    else:
+                        if self.latest_version == "Checking...":
+                            self.latest_version = "Unknown"
+                else:
+                    if self.latest_version == "Checking...":
+                        self.latest_version = "Error"
+        except Exception as e:
+            if self.latest_version == "Checking...":
+                self.latest_version = "Unknown"
+            logger.debug(f"Version check skipped or failed: {e}")
 
     @staticmethod
     def _strip_fake_png_header_from_ts(content: bytes) -> bytes:
@@ -436,7 +557,9 @@ class HLSProxy:
 
         return ts, nonce, fingerprint, key_path
 
-    async def _get_session(self, prefer_default_family: bool = False):
+    async def _get_session(self, prefer_default_family: bool = False, url: str = None):
+        if url:
+            self._check_dynamic_warp_bypass(url)
         target_attr = "flex_session" if prefer_default_family else "session"
         session = getattr(self, target_attr)
         if session is None or session.closed:
@@ -451,12 +574,59 @@ class HLSProxy:
 
             connector = TCPConnector(**connector_kwargs)
             session = aiohttp.ClientSession(
-                timeout=ClientTimeout(total=30), connector=connector
+                timeout=ClientTimeout(total=None, connect=30, sock_connect=30, sock_read=None),
+                connector=connector,
             )
             setattr(self, target_attr, session)
         return session
 
+    def _check_dynamic_warp_bypass(self, url: str):
+        """Dynamically adds domain to WARP bypass if it matches known patterns."""
+        if not ENABLE_WARP or VERSION_MODE != "Full":
+            return
+            
+        # Patterns for domains that usually block Cloudflare/WARP
+        # Cinemacity, VixSrc, etc.
+        bypass_patterns = [
+            "cccdn.net", "cinemacity.cc", "strem.fun", "torrentio.strem.fun"
+        ]
+        
+        try:
+            from urllib.parse import urlsplit
+            domain = urlsplit(url).netloc
+            if not domain: return
+            
+            # If domain matches any pattern and hasn't been bypassed yet
+            is_problematic = any(p in domain.lower() for p in bypass_patterns)
+
+            if is_problematic:
+                if domain not in BYPASSED_WARP_DOMAINS:
+                    # Always bypass base domain for these providers
+                    base_domain = ".".join(domain.split(".")[-2:])
+                    logging.info(f"⚡ [Dynamic Bypass] Adding {base_domain} (and {domain}) to WARP exclusion list...")
+                    
+                    os.system(f"warp-cli --accept-tos tunnel host add {base_domain} > /dev/null 2>&1")
+                    os.system(f"warp-cli --accept-tos tunnel host add {domain} > /dev/null 2>&1")
+                    
+                    # In Proxy mode, we must also update the local exclusion list
+                    if base_domain not in WARP_EXCLUDE_DOMAINS:
+                        WARP_EXCLUDE_DOMAINS.append(base_domain)
+                    if domain not in WARP_EXCLUDE_DOMAINS:
+                        WARP_EXCLUDE_DOMAINS.append(domain)
+                    
+                    BYPASSED_WARP_DOMAINS.add(domain)
+                    BYPASSED_WARP_DOMAINS.add(base_domain)
+                    time.sleep(1.0)
+        except Exception as e:
+            logging.error(f"❌ Error in dynamic WARP bypass: {e}")
+
     async def _get_proxy_session(self, url: str):
+        """Get a session with proxy support for the given URL."""
+        self._check_dynamic_warp_bypass(url)
+        
+        # Debug: Check current egress IP for this domain (optional, slow if enabled)
+        # if any(p in url for p in ["vavoo", "mediahub"]):
+        #    logger.info(f"🔍 Requesting {url} via {'DIRECT' if any(d in url for d in BYPASSED_WARP_DOMAINS) else 'WARP'}")
         """Get a session with proxy support for the given URL.
 
         Sessions are cached and reused for the same proxy to improve performance.
@@ -465,7 +635,11 @@ class HLSProxy:
         - session: The aiohttp ClientSession to use
         - proxy_url: The proxy URL being used, or None for direct connection
         """
+        # Trigger dynamic bypass check before getting proxy settings
+        self._check_dynamic_warp_bypass(url)
+        
         proxy = get_proxy_for_url(url, TRANSPORT_ROUTES, GLOBAL_PROXIES)
+
         prefer_default_family = "ai.the-sunmoon.site/key/" in url
 
         if proxy:
@@ -482,15 +656,24 @@ class HLSProxy:
             # Create new session and cache it
             logger.info(f"🌍 Creating proxy session: {proxy}")
             try:
+                # Gestione manuale di socks5h per compatibilità con aiohttp-socks
+                connector_url = proxy
+                rdns = True # Default per SOCKS5
+                if connector_url.startswith("socks5h://"):
+                    connector_url = connector_url.replace("socks5h://", "socks5://")
+                    rdns = True
+                    logger.debug(f"🕵️ SOCKS5h detected: forcing remote DNS resolution")
+
                 # Unlimited connections for maximum speed
                 connector = ProxyConnector.from_url(
-                    proxy,
+                    connector_url,
                     limit=0,  # Unlimited connections
                     limit_per_host=0,  # Unlimited per host
                     keepalive_timeout=60,  # Keep connections alive longer
                     family=socket.AF_INET,  # Force IPv4
+                    rdns=rdns,
                 )
-                timeout = ClientTimeout(total=30)
+                timeout = ClientTimeout(total=None, connect=30, sock_connect=30, sock_read=None)
                 session = ClientSession(timeout=timeout, connector=connector)
                 self.proxy_sessions[proxy] = session  # Cache the session
                 return session, proxy  # Return proxy URL for logging
@@ -502,6 +685,45 @@ class HLSProxy:
         # Fallback to shared non-proxy session
         session = await self._get_session(prefer_default_family=prefer_default_family)
         return session, None
+
+    async def _retry_cccdn_request(self, request_target, headers, disable_ssl: bool):
+        """Retry cccdn once via an alternate aiohttp route when direct access returns 403."""
+        retry_proxy = None
+        if ENABLE_WARP:
+            retry_proxy = WARP_PROXY_URL
+        elif GLOBAL_PROXIES:
+            retry_proxy = GLOBAL_PROXIES[0]
+
+        if not retry_proxy:
+            return None
+
+        try:
+            connector = get_connector_for_proxy(
+                retry_proxy,
+                limit=0,
+                limit_per_host=0,
+                keepalive_timeout=60,
+                family=socket.AF_INET,
+                rdns=True,
+            )
+            timeout = ClientTimeout(total=None, connect=30, sock_connect=30, sock_read=None)
+            async with ClientSession(timeout=timeout, connector=connector) as retry_session:
+                async with retry_session.get(
+                    request_target,
+                    headers=headers,
+                    ssl=not disable_ssl,
+                ) as retry_resp:
+                    if retry_resp.status not in [200, 206]:
+                        return None
+                    return {
+                        "status": retry_resp.status,
+                        "headers": dict(retry_resp.headers),
+                        "body": await retry_resp.read(),
+                        "proxy": retry_proxy,
+                    }
+        except Exception as e:
+            logger.warning("⚠️ cccdn retry via alternate route failed: %r", e)
+            return None
 
     @staticmethod
     def _query_flag_is_true(value: str | None) -> bool:
@@ -813,10 +1035,12 @@ class HLSProxy:
                         request_headers, proxies=proxy_list
                     )
                 return self.extractors[key]
-            elif "popcdn.day" in url:
+            elif "popcdn.day" in url or "freeshot.live" in url:
                 key = "freeshot"
                 proxy = get_proxy_for_url(
-                    "popcdn.day", TRANSPORT_ROUTES, GLOBAL_PROXIES
+                    "popcdn.day" if "popcdn.day" in url else "freeshot.live", 
+                    TRANSPORT_ROUTES, 
+                    GLOBAL_PROXIES
                 )
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
@@ -1073,6 +1297,17 @@ class HLSProxy:
         extractor = None
         try:
             target_url = request.query.get("url") or request.query.get("d")
+            
+            # --- Gestione URL brevi (Shortened URLs) ---
+            url_id = request.query.get("hls_url_id")
+            if url_id and url_id in self.hls_url_map:
+                target_url, stored_at, entry_ttl = self.hls_url_map[url_id]
+                if time.time() - stored_at <= entry_ttl:
+                    logger.debug(f"🔗 Resolved short URL ID: {url_id}")
+                else:
+                    self.hls_url_map.pop(url_id, None)
+                    target_url = None
+
             force_refresh = request.query.get("force", "false").lower() == "true"
             redirect_stream = (
                 request.query.get("redirect_stream", "true").lower() == "true"
@@ -1086,20 +1321,13 @@ class HLSProxy:
             # (for example Firebase Storage object paths using `%2F`) would be
             # corrupted and upstream would respond with HTTP 400.
 
-            # ✅ FIX: Extract h_ headers from query params BEFORE calling get_extractor
-            # This ensures GenericHLSExtractor receives the correct Referer/Origin from h_ params
-            # instead of generating them based on the segment's domain.
-            combined_headers = dict(request.headers)
+            # --- GESTIONE HEADER ---
+            combined_headers = {}
+            
+            # 0. Header passati come h_X=Y
             for param_name, param_value in request.query.items():
                 if param_name.startswith("h_"):
                     header_name = param_name[2:]
-                    
-                    # ✅ FIX: Rimuovi eventuali header duplicati (case-insensitive)
-                    # Es. se arriva h_Referer, rimuovi sia 'Referer' che 'referer' già presenti
-                    keys_to_remove = [k for k in combined_headers.keys() if k.lower() == header_name.lower()]
-                    for k in keys_to_remove:
-                        del combined_headers[k]
-                    
                     combined_headers[header_name] = param_value
 
 
@@ -1117,6 +1345,7 @@ class HLSProxy:
                         "icy-metadata",
                         "accept-encoding",
                         "content-length",
+                        "x-easyproxy-disable-ssl",
                     }:
                         continue
                     stream_headers[header_name] = header_value
@@ -1140,6 +1369,13 @@ class HLSProxy:
                 stream_url = result["destination_url"]
                 stream_headers = result.get("request_headers", {})
                 captured_manifest = result.get("captured_manifest")
+                force_disable_ssl = result.get("disable_ssl", False)
+
+                if force_disable_ssl:
+                    if "?" in stream_url:
+                        stream_url += "&disable_ssl=1"
+                    else:
+                        stream_url += "?disable_ssl=1"
 
 
             # Se redirect_stream è False, restituisci il JSON con i dettagli (stile MediaFlow)
@@ -1155,16 +1391,16 @@ class HLSProxy:
                     else "hls_proxy"
                 )
 
-                # Determina l'endpoint corretto (Logic aggiornata come nell'extractor)
+                # Determina l'endpoint corretto
                 endpoint = "/proxy/hls/manifest.m3u8"
-                if (
-                    mediaflow_endpoint == "proxy_stream_endpoint"
-                    or ".mp4" in stream_url
-                    or ".mkv" in stream_url
-                    or ".avi" in stream_url
-                ):
+                
+                # Check extension of the actual path, not the whole URL
+                path_lower = urllib.parse.urlparse(stream_url).path.lower()
+                is_direct_video = any(path_lower.endswith(ext) for ext in [".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv"])
+                
+                if mediaflow_endpoint == "proxy_stream_endpoint" or is_direct_video:
                     endpoint = "/proxy/stream"
-                elif ".mpd" in stream_url:
+                elif ".mpd" in path_lower or "manifest" in path_lower and "dash" in path_lower:
                     endpoint = "/proxy/mpd/manifest.m3u8"
 
                 # Prepariamo i parametri per il JSON
@@ -1189,15 +1425,20 @@ class HLSProxy:
                 original_channel_url = request.query.get("url") or request.query.get("d", "")
                 api_password = request.query.get("api_password")
                 no_bypass = request.query.get("no_bypass") == "1"
+                use_short_hls_urls = (
+                    "cinemacity.cc" in (original_channel_url or "").lower()
+                    or request.query.get("host", "").lower() in {"city", "cinemacity"}
+                )
                 rewritten_manifest = await ManifestRewriter.rewrite_manifest_urls(
-                    captured_manifest,
-                    stream_url,
-                    proxy_base,
-                    stream_headers,
-                    original_channel_url,
-                    api_password,
-                    self.get_extractor,
-                    no_bypass,
+                    manifest_content=captured_manifest,
+                    base_url=stream_url,
+                    proxy_base=proxy_base,
+                    stream_headers=stream_headers,
+                    original_channel_url=original_channel_url,
+                    api_password=api_password,
+                    get_extractor_func=self.get_extractor,
+                    no_bypass=no_bypass,
+                    shorten_url_func=self.shorten_hls_url if use_short_hls_urls else None,
                 )
                 return web.Response(
                     text=rewritten_manifest,
@@ -1495,6 +1736,7 @@ class HLSProxy:
                 "expired vixsrc embed url" in error_msg
                 or ("vixsrc" in error_msg and "expired" in error_msg and "embed" in error_msg)
             )
+            is_not_found = "404" in error_msg or "not found" in error_msg
             is_temporary_error = any(
                 x in error_msg
                 for x in [
@@ -1518,11 +1760,17 @@ class HLSProxy:
                 logger.info("Expired VixSrc embed URL rejected: %s", str(e))
                 return web.Response(text=str(e), status=410)
 
-            # Se è un errore temporaneo (sito offline), logga solo un WARNING senza traceback
+            if is_not_found:
+                logger.warning(f"🔍 {extractor_name}: Content not found (404). File missing or possible IP block. (Try opening the link in a browser to verify) - {str(e)}")
+                return web.Response(text=f"Content not found: {str(e)}", status=404)
+
+            # Gestione errori di connessione o blocchi
             if is_temporary_error:
-                logger.warning(
-                    f"⚠️ {extractor_name}: Service temporarily unavailable - {str(e)}"
-                )
+                if "403" in error_msg or "forbidden" in error_msg:
+                    logger.error(f"🚫 {extractor_name}: Access denied (403 Forbidden). Possible IP block or WAF protection. - {str(e)}")
+                else:
+                    logger.warning(f"📡 {extractor_name}: Connection failed (Timeout/Connection Error). Site might be down or IP is blocked. - {str(e)}")
+                
                 return web.Response(
                     text=f"Service temporarily unavailable: {str(e)}", status=503
                 )
@@ -1538,7 +1786,7 @@ class HLSProxy:
         Supporta redirect_stream per ridirezionare direttamente al proxy.
         """
         # Log request details for debugging
-        logger.info(f"📥 Extractor Request: {request.url}")
+        logger.debug(f"📥 Extractor Request: {request.url}")
 
         if not check_password(request):
             logger.warning("⛔ Unauthorized extractor request")
@@ -1621,7 +1869,7 @@ class HLSProxy:
                     "https://"
                 ):
                     url = decoded_str
-                    logger.info(f"🔓 Base64 decoded URL: {url}")
+                    logger.debug(f"🔓 Base64 decoded URL: {url}")
             except Exception:
                 # Non è Base64 o non è un URL valido, proseguiamo con l'originale
                 pass
@@ -1634,14 +1882,24 @@ class HLSProxy:
                 f"🔍 Extracting: {url} (Host: {host_param}, Redirect: {redirect_stream})"
             )
 
+            # Collect all query parameters to pass to the extractor
+            extractor_kwargs = dict(request.query)
+            extractor_kwargs.pop('url', None) # Remove to avoid duplicate argument error
+            extractor_kwargs.pop('d', None)   # Remove to avoid duplicate argument error
+            extractor_kwargs['request_headers'] = dict(request.headers)
+
             extractor = await self.get_extractor(
                 url, dict(request.headers), host=host_param
             )
-            result = await extractor.extract(url, request_headers=dict(request.headers))
+            extractor = await self.get_extractor(
+                url, dict(request.headers), host=host_param
+            )
+            result = await extractor.extract(url, **extractor_kwargs)
 
             stream_url = result["destination_url"]
             stream_headers = result.get("request_headers", {})
             mediaflow_endpoint = result.get("mediaflow_endpoint", "hls_proxy")
+            force_disable_ssl = result.get("disable_ssl", False)
 
             logger.info(
                 f"✅ Extraction success: {stream_url[:50]}... Endpoint: {mediaflow_endpoint}"
@@ -1654,14 +1912,14 @@ class HLSProxy:
 
             # Determina l'endpoint corretto
             endpoint = "/proxy/hls/manifest.m3u8"
-            if (
-                mediaflow_endpoint == "proxy_stream_endpoint"
-                or ".mp4" in stream_url
-                or ".mkv" in stream_url
-                or ".avi" in stream_url
-            ):
+            
+            # Check extension of the actual path, not the whole URL
+            path_lower = urllib.parse.urlparse(stream_url).path.lower()
+            is_direct_video = any(path_lower.endswith(ext) for ext in [".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv"])
+            
+            if mediaflow_endpoint == "proxy_stream_endpoint" or is_direct_video:
                 endpoint = "/proxy/stream"
-            elif ".mpd" in stream_url:
+            elif ".mpd" in path_lower or "manifest" in path_lower and "dash" in path_lower:
                 endpoint = "/proxy/mpd/manifest.m3u8"
 
             encoded_url = urllib.parse.quote(stream_url, safe="")
@@ -1677,11 +1935,14 @@ class HLSProxy:
             if api_password:
                 header_params += f"&api_password={api_password}"
 
+            if force_disable_ssl:
+                header_params += "&disable_ssl=1"
+
             # 1. URL COMPLETO (Solo per il redirect)
             full_proxy_url = f"{proxy_base}{endpoint}?d={encoded_url}{header_params}"
 
             if redirect_stream:
-                logger.info(f"↪️ Redirecting to: {full_proxy_url}")
+                logger.debug(f"↪️ Redirecting to: {full_proxy_url}")
                 return web.HTTPFound(full_proxy_url)
 
             # 2. URL PULITO (Per il JSON stile MediaFlow)
@@ -1733,7 +1994,7 @@ class HLSProxy:
             # 1. Modalità ClearKey Statica
             clearkey_param = request.query.get("clearkey")
             if clearkey_param:
-                logger.info(f"🔑 Static ClearKey license request: {clearkey_param}")
+                logger.debug(f"🔑 Static ClearKey license request: {clearkey_param}")
                 try:
                     # Support multiple keys separated by comma
                     # Format: KID1:KEY1,KID2:KEY2
@@ -1856,17 +2117,48 @@ class HLSProxy:
             # Avoid unquoting again or embedded encoded URLs may break.
 
             original_channel_url = request.query.get("original_channel_url")
+            
+            # Detect DLStreams keys by multiple signals:
+            # 1. original_channel_url contains known domains
+            # 2. key_url matches /key/premium pattern (CDN rotates domains)
+            # 3. original_channel_url contains the mono.css manifest pattern
+            is_dlstreams_key = False
             if original_channel_url and any(
-                marker in original_channel_url for marker in ["dlhd.dad", "dlstreams.top"]
+                marker in original_channel_url for marker in ["dlhd.dad", "dlstreams.top", "dlstreams.com"]
             ):
+                is_dlstreams_key = True
+            elif re.search(r"/key/premium\d+/", key_url):
+                is_dlstreams_key = True
+            elif original_channel_url and re.search(r"/proxy/.+/premium\d+/mono\.css", original_channel_url):
+                is_dlstreams_key = True
+
+            if is_dlstreams_key:
+                # First check if the DLStreams extractor already has this key cached
+                dlstreams_extractor = self.extractors.get("dlstreams")
+                if dlstreams_extractor and hasattr(dlstreams_extractor, "_browser_key_cache"):
+                    cached_key = dlstreams_extractor._browser_key_cache.get(key_url)
+                    if cached_key:
+                        logger.info("✅ AES key served from DLStreams browser cache (%d bytes)", len(cached_key))
+                        return web.Response(
+                            body=cached_key,
+                            content_type="application/octet-stream",
+                            headers={
+                                "Access-Control-Allow-Origin": "*",
+                                "Access-Control-Allow-Headers": "*",
+                                "Cache-Control": "no-cache, no-store, must-revalidate",
+                            },
+                        )
+
+                # Fallback: try browser-based key fetch
                 try:
-                    extractor = await self.get_extractor(original_channel_url, {})
-                    if hasattr(extractor, "fetch_key_via_browser"):
-                        browser_key = await extractor.fetch_key_via_browser(
-                            key_url, original_channel_url
+                    if dlstreams_extractor and hasattr(dlstreams_extractor, "fetch_key_via_browser"):
+                        # Use original_channel_url or reconstruct from key_url
+                        fetch_url = original_channel_url or key_url
+                        browser_key = await dlstreams_extractor.fetch_key_via_browser(
+                            key_url, fetch_url
                         )
                         if browser_key:
-                            logger.info("✅ AES key fetched via browser context")
+                            logger.info("✅ AES key fetched via browser context (%d bytes)", len(browser_key))
                             return web.Response(
                                 body=browser_key,
                                 content_type="application/octet-stream",
@@ -1876,6 +2168,24 @@ class HLSProxy:
                                     "Cache-Control": "no-cache, no-store, must-revalidate",
                                 },
                             )
+                    elif original_channel_url:
+                        # Try to get extractor via original URL
+                        extractor = await self.get_extractor(original_channel_url, {})
+                        if hasattr(extractor, "fetch_key_via_browser"):
+                            browser_key = await extractor.fetch_key_via_browser(
+                                key_url, original_channel_url
+                            )
+                            if browser_key:
+                                logger.info("✅ AES key fetched via browser context (%d bytes)", len(browser_key))
+                                return web.Response(
+                                    body=browser_key,
+                                    content_type="application/octet-stream",
+                                    headers={
+                                        "Access-Control-Allow-Origin": "*",
+                                        "Access-Control-Allow-Headers": "*",
+                                        "Cache-Control": "no-cache, no-store, must-revalidate",
+                                    },
+                                )
                 except Exception as browser_key_exc:
                     logger.warning(
                         f"⚠️ Browser-backed key fetch failed, falling back to direct request: {browser_key_exc}"
@@ -1893,19 +2203,19 @@ class HLSProxy:
                         continue
                     headers[header_name] = param_value
 
-            logger.info(f"🔑 Fetching AES key from: {key_url}")
-            logger.info(f"   -> with headers: {headers}")
+            logger.debug(f"🔑 Fetching AES key from: {key_url}")
+            logger.debug(f"   -> with headers: {headers}")
 
             # ✅ Use pooled session for better performance
             # The session already has the proxy configured in its connector
             if self._should_force_direct_from_query(request):
-                session = await self._get_session()
+                session = await self._get_session(url=key_url)
                 proxy_used = None
-                logger.info("Using direct session for AES key request (forced)")
+                logger.debug("Using direct session for AES key request (forced)")
             else:
                 session, proxy_used = await self._get_proxy_session(key_url)
                 if proxy_used:
-                    logger.info(f"Using pooled session with proxy: {proxy_used}")
+                    logger.debug(f"Using pooled session with proxy: {proxy_used}")
             secret_key = headers.pop("X-Secret-Key", None)
 
             # Calcola X-Key-Timestamp, X-Key-Nonce, X-Fingerprint, e X-Key-Path se abbiamo la secret_key
@@ -1925,7 +2235,7 @@ class HLSProxy:
                     headers["X-Key-Nonce"] = str(nonce)
                     headers["X-Fingerprint"] = fingerprint
                     headers["X-Key-Path"] = key_path
-                    logger.info(
+                    logger.debug(
                         f"🔐 Computed key headers: ts={ts}, nonce={nonce}, fingerprint={fingerprint}, key_path={key_path}"
                     )
                 else:
@@ -1933,23 +2243,31 @@ class HLSProxy:
 
             # Caso 'auth' - URL che contengono 'auth' richiedono headers speciali
             if "auth" in key_url.lower():
-                logger.info(
+                logger.debug(
                     f"🔐 Detected 'auth' key URL, ensuring special headers are present"
                 )
                 if "X-User-Agent" not in headers:
                     headers["X-User-Agent"] = headers.get(
                         "User-Agent", headers.get("user-agent", "Mozilla/5.0")
                     )
-                logger.info(
+                logger.debug(
                     f"🔐 Auth key headers: Authorization={'***' if headers.get('Authorization') else 'missing'}, X-Channel-Key={headers.get('X-Channel-Key', 'missing')}, X-User-Agent={headers.get('X-User-Agent', 'missing')}"
                 )
 
             async with session.get(key_url, headers=headers) as resp:
                 if resp.status == 200 or resp.status == 206:
                     key_data = await resp.read()
-                    logger.info(
+                    logger.debug(
                         f"✅ AES key fetched successfully: {len(key_data)} bytes"
                     )
+
+                    # Warn if key size is unexpected (AES-128 = 16 bytes)
+                    if len(key_data) != 16 and is_dlstreams_key:
+                        logger.warning(
+                            f"⚠️ DLStreams AES key response is {len(key_data)} bytes (expected 16). "
+                            f"The CDN may have returned an error page instead of the key. "
+                            f"Session cookies may be missing."
+                        )
 
                     return web.Response(
                         body=key_data,
@@ -2026,7 +2344,21 @@ class HLSProxy:
     async def _proxy_segment(self, request, segment_url, stream_headers, segment_name):
         """✅ NUOVO: Proxy dedicato per segmenti .ts con Content-Disposition"""
         try:
+            # Ping DLStreams extractor to keep browser alive during playback
+            # Use robust markers: Daddy's domains, 'premium' pattern, 'mono.css', or Referer/Origin headers
+            is_dlstreams = any(m in segment_url for m in ["dlhd.dad", "dlstreams", "premium", "mono.css"])
+            if not is_dlstreams:
+                ref = request.query.get("h_Referer", "") or request.headers.get("Referer", "")
+                origin = request.query.get("h_Origin", "") or request.headers.get("Origin", "")
+                is_dlstreams = any(m in (ref + origin).lower() for m in ["dlhd.dad", "dlstreams"])
+            
+            if is_dlstreams:
+                ext = self.extractors.get("dlstreams")
+                if ext and hasattr(ext, "_update_shared_activity"):
+                    ext._update_shared_activity()
+
             headers = dict(stream_headers)
+            is_cccdn_stream = "cccdn.net" in segment_url
 
             def set_response_header(target: dict, name: str, value: str):
                 keys_to_remove = [k for k in target.keys() if k.lower() == name.lower()]
@@ -2039,16 +2371,18 @@ class HLSProxy:
                 if header in request.headers:
                     headers[header] = request.headers[header]
 
+            if is_cccdn_stream:
+                headers["Accept-Encoding"] = "identity"
+
             # ✅ Use pooled session for better performance
             session, _ = await self._get_proxy_session(segment_url)
-            async with session.get(segment_url, headers=headers) as resp:
-                content_bytes = await resp.read()
-                content_bytes = self._strip_fake_png_header_from_ts(content_bytes)
+            # ✅ Use yarl.URL with encoded=True to prevent double-encoding of commas
+            final_segment_url = yarl.URL(segment_url, encoded=True)
+            async with session.get(final_segment_url, headers=headers) as resp:
                 response_headers = {}
 
                 for header in [
                     "content-type",
-                    "content-length",
                     "content-range",
                     "accept-ranges",
                     "last-modified",
@@ -2078,15 +2412,30 @@ class HLSProxy:
                     "Range, Content-Type",
                 )
 
-                set_response_header(
-                    response_headers, "Content-Length", str(len(content_bytes))
-                )
+                response = web.StreamResponse(status=resp.status, headers=response_headers)
+                await response.prepare(request)
 
-                return web.Response(
-                    body=content_bytes,
-                    status=resp.status,
-                    headers=response_headers,
-                )
+                first_chunk = True
+                try:
+                    async for chunk in resp.content.iter_any():
+                        if first_chunk:
+                            chunk = self._strip_fake_png_header_from_ts(chunk)
+                            first_chunk = False
+                        await response.write(chunk)
+                    await response.write_eof()
+                    return response
+                except (ClientPayloadError, ConnectionResetError, OSError) as e:
+                    logger.info(
+                        "Segment stream interrupted for %s [%s]: %s",
+                        segment_name,
+                        type(e).__name__,
+                        e,
+                    )
+                    return response
+                except Exception as e:
+                    if "Connection lost" not in str(e) and "closing transport" not in str(e):
+                        logger.error(f"Error streaming segment {segment_name}: {str(e)}")
+                    return response
 
         except Exception as e:
             logger.error(f"Error in segment proxy: {str(e)}")
@@ -2095,6 +2444,19 @@ class HLSProxy:
     async def _proxy_stream(self, request, stream_url, stream_headers):
         """Effettua il proxy dello stream con gestione manifest e AES-128"""
         try:
+            # Ping DLStreams extractor to keep browser alive during playback
+            # Use robust markers: Daddy's domains, 'premium' pattern, 'mono.css', or Referer/Origin headers
+            is_dlstreams = any(m in stream_url for m in ["dlhd.dad", "dlstreams", "premium", "mono.css"])
+            if not is_dlstreams:
+                ref = request.query.get("h_Referer", "") or request.headers.get("Referer", "")
+                origin = request.query.get("h_Origin", "") or request.headers.get("Origin", "")
+                is_dlstreams = any(m in (ref + origin).lower() for m in ["dlhd.dad", "dlstreams"])
+
+            if is_dlstreams:
+                ext = self.extractors.get("dlstreams")
+                if ext and hasattr(ext, "_update_shared_activity"):
+                    ext._update_shared_activity()
+
             headers = dict(stream_headers)
 
             def set_response_header(target: dict, name: str, value: str):
@@ -2120,6 +2482,19 @@ class HLSProxy:
             # partial 206 responses and breaks rewriting.
             if "manifest.m3u8" in request.path and "range" in headers:
                 del headers["range"]
+
+            # ✅ FIX: Remove 'zstd' from Accept-Encoding to prevent "Can not decode content-encoding" error
+            if "accept-encoding" in headers:
+                ae = headers["accept-encoding"].lower()
+                if "zstd" in ae:
+                    # Replace zstd with nothing, cleaning up commas
+                    new_ae = ae.replace("zstd", "").replace(", ,", ",").strip(", ")
+                    headers["accept-encoding"] = new_ae
+            elif "Accept-Encoding" in headers:
+                ae = headers["Accept-Encoding"].lower()
+                if "zstd" in ae:
+                    new_ae = ae.replace("zstd", "").replace(", ,", ",").strip(", ")
+                    headers["Accept-Encoding"] = new_ae
 
             # Rimuovi esplicitamente headers che potrebbero rivelare l'IP originale
             for h in ["x-forwarded-for", "x-real-ip", "forwarded", "via"]:
@@ -2151,229 +2526,303 @@ class HLSProxy:
             # logger.info(f"   Final Stream Headers: {headers}")
 
             # ✅ NUOVO: Determina se disabilitare SSL per questo dominio
-            disable_ssl = get_ssl_setting_for_url(stream_url, TRANSPORT_ROUTES)
+            disable_ssl = (
+                request.query.get("h_X-EasyProxy-Disable-SSL") == "1"
+                or request.query.get("disable_ssl") == "1"
+                or headers.get("X-EasyProxy-Disable-SSL") == "1"
+                or get_ssl_setting_for_url(stream_url, TRANSPORT_ROUTES)
+            )
+            headers.pop("X-EasyProxy-Disable-SSL", None)
+            headers.pop("x-easyproxy-disable-ssl", None)
+            is_cccdn_stream = "cccdn.net" in stream_url
+
+            if is_cccdn_stream:
+                headers["Accept-Encoding"] = "identity"
+
+            def _cookie_summary(value: str | None) -> str:
+                if not value:
+                    return "0"
+                return str(len([part for part in value.split(";") if part.strip()]))
+
+            def _short_url(value: str, limit: int = 120) -> str:
+                if len(value) <= limit:
+                    return value
+                return value[:limit] + "..."
 
             # ✅ Use pooled session for better performance
             if self._should_force_direct_from_query(request):
-                session = await self._get_session()
+                session = await self._get_session(url=stream_url)
                 session_proxy = None
                 logger.info(
                     f"[Proxy Stream] Using direct session (forced) for: {stream_url}"
                 )
             else:
                 session, session_proxy = await self._get_proxy_session(stream_url)
-                logger.info(
-                    f"📡 [Proxy Stream] Using session{f' via proxy {session_proxy}' if session_proxy else ' (direct)'} for: {stream_url}"
-                )
-            # ✅ TLS FINGERPRINT BYPASS: Use curl_cffi for problematic CDNs (CinemaCity)
-            use_curl_cffi = HAS_CURL_CFFI and "cccdn.net" in stream_url
-            
-            if use_curl_cffi:
-                curl_proxy = f"{request.scheme}://{session_proxy}" if session_proxy else None
-                if curl_proxy and "://" not in curl_proxy: curl_proxy = f"http://{curl_proxy}"
-
-                logger.info(f"🛡️ [Proxy Stream] Using curl_cffi (impersonate=chrome) for: {stream_url}")
                 
-                class CurlContextManager:
-                    def __init__(self, url, headers, proxy):
-                        self.url, self.headers, self.proxy = url, headers, proxy
-                        self.session = None
-                    async def __aenter__(self):
-                        self.session = CurlAsyncSession(impersonate="chrome120")
-                        await self.session.__aenter__()
-                        c_resp = await self.session.get(self.url, headers=self.headers, proxy=self.proxy, timeout=30)
-                        
-                        class AioHttpMock:
-                            def __init__(self, c_resp, session):
-                                self.status = c_resp.status_code
-                                self.headers = c_resp.headers
-                                self.url = c_resp.url
-                                self._content = c_resp.content
-                                self.session = session
-                                class Content:
-                                    def __init__(self, data): self.data = data
-                                    async def iter_chunked(self, n):
-                                        for i in range(0, len(self.data), n): yield self.data[i:i+n]
-                                self.content = Content(c_resp.content)
-                            async def read(self): return self._content
-                        return AioHttpMock(c_resp, self.session)
-                    async def __aexit__(self, exc_type, exc, tb):
-                        if self.session: await self.session.__aexit__(exc_type, exc, tb)
+                # ✅ FIX LOG: Determine correct routing for display
+                if session_proxy:
+                    routing = f"WARP (Cloudflare IP)" if (WARP_PROXY_URL and session_proxy == WARP_PROXY_URL) else f"PROXY ({session_proxy})"
+                else:
+                    routing = "BYPASS (Real IP)"
+                
+                logger.info(
+                    f"📡 [Proxy Stream] {routing} - Using session (direct) for: {stream_url}"
+                )
 
-                resp_ctx = CurlContextManager(stream_url, headers, curl_proxy)
+            # --- PROTECTED DOMAINS FALLBACK: curl_cffi ---
+            use_curl_cffi = HAS_CURL_CFFI and (not is_cccdn_stream) and any(d in stream_url for d in ["cinemacity.cc", "torrentio", "strem.fun"])
+            
+            if use_curl_cffi and any(d in stream_url for d in ["torrentio", "strem.fun"]):
+                # Only use curl_cffi for Torrentio if it's a manifest or explicitly requested
+                is_manifest_req = any(ext in stream_url.lower() for ext in [".m3u8", ".mpd", "manifest"])
+                if not is_manifest_req:
+                    use_curl_cffi = False
+
+            if use_curl_cffi:
+                logger.info(f"🚀 [curl_cffi] Using browser impersonation for: {stream_url}")
+                try:
+                    # Use a pooled curl session if available
+                    session_key = f"curl_{session_proxy or 'direct'}"
+                    if session_key not in self.curl_sessions or self.curl_sessions[session_key] is None:
+                        self.curl_sessions[session_key] = CurlAsyncSession(impersonate="chrome124")
+                    
+                    curl_s = self.curl_sessions[session_key]
+                    curl_headers = dict(headers)
+                    
+                    # ✅ FIX: Remove User-Agent from headers to let curl_cffi use the one matching the fingerprint
+                    # A mismatch between the TLS fingerprint and the User-Agent header often causes 403 Forbidden.
+                    if "User-Agent" in curl_headers:
+                        del curl_headers["User-Agent"]
+                    if "user-agent" in curl_headers:
+                        del curl_headers["user-agent"]
+                    
+                    # Preserve extractor-provided Referer for cccdn.net.
+                    # Some streams require the exact movie page, not the site root.
+                    if "cccdn.net" in stream_url:
+                        referer_value = (
+                            curl_headers.get("Referer")
+                            or curl_headers.get("referer")
+                            or "https://cinemacity.cc/"
+                        )
+                        curl_headers["Referer"] = referer_value
+                        try:
+                            parsed_referer = urllib.parse.urlparse(referer_value)
+                            if parsed_referer.scheme and parsed_referer.netloc:
+                                curl_headers["Origin"] = f"{parsed_referer.scheme}://{parsed_referer.netloc}"
+                            else:
+                                curl_headers["Origin"] = "https://cinemacity.cc"
+                        except Exception:
+                            curl_headers["Origin"] = "https://cinemacity.cc"
+                        curl_headers["Sec-Fetch-Site"] = "same-site"
+                        curl_headers["Sec-Fetch-Mode"] = "cors"
+                        curl_headers["Sec-Fetch-Dest"] = "empty"
+                        if "Accept-Language" not in curl_headers:
+                            curl_headers["Accept-Language"] = "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7"
+                    elif "Referer" not in curl_headers and "referer" not in curl_headers:
+                        # Fallback for others if missing
+                        pass 
+                    
+                    # Ensure Accept is broad
+                    if "Accept" not in curl_headers:
+                        curl_headers["Accept"] = "*/*"
+
+                    curl_proxies = None
+                    # ✅ DEBUG: Log final headers for comparison
+                    logger.debug(f"🚀 [curl_cffi] Sending headers for {stream_url[:50]}: {curl_headers}")
+
+                    curl_proxies = None
+                    if session_proxy:
+                        curl_proxies = {"http": session_proxy, "https": session_proxy}
+                    
+                    # ✅ CRITICAL FIX: Ensure commas are NOT encoded. 
+                    # cccdn.net multi-path URLs MUST have literal commas.
+                    final_curl_url = stream_url
+                    if "cccdn.net" in final_curl_url:
+                        final_curl_url = urllib.parse.unquote(final_curl_url)
+
+                    # ✅ NUOVO: Se è un manifest, proviamo a usare smart_request come fallback
+                    # se curl_cffi diretto dovesse dare ancora 403.
+                    is_manifest = ".m3u8" in final_curl_url.lower() or ".mpd" in final_curl_url.lower()
+                    curl_resp = await curl_s.get(
+                        final_curl_url, 
+                        headers=curl_headers, 
+                        proxies=curl_proxies,
+                        verify=not disable_ssl,
+                        timeout=30,
+                        stream=True,
+                        allow_redirects=True
+                    )
+                    class MockContent:
+                        def __init__(self, c_resp): self.c_resp = c_resp
+                        async def iter_any(self):
+                            async for chunk in self.c_resp.aiter_content():
+                                yield chunk
+                        async def read(self): return await self.c_resp.acontent()
+
+                    class MockResp:
+                        def __init__(self, c_resp):
+                            self.status = c_resp.status_code
+                            self.headers = c_resp.headers
+                            self.url = yarl.URL(c_resp.url)
+                            self.content = MockContent(c_resp)
+                        async def read(self): return await self.content.read()
+                        async def text(self, errors='replace'):
+                            content = await self.read()
+                            return content.decode('utf-8', errors=errors)
+                        async def close(self): pass # Session is pooled
+                        async def __aenter__(self): return self
+                        async def __aexit__(self, exc_type, exc_val, exc_tb): pass
+
+                    # Se curl_cffi fallisce con 403 su un manifest, proviamo FlareSolverr via smart_request
+                    if curl_resp.status_code in [502, 503, 504]:
+                        logger.warning(f"⚠️ [curl_cffi] {curl_resp.status_code} error for {final_curl_url[:50]}, falling back to standard aiohttp...")
+                        goto_manifest_processing = False
+                    elif curl_resp.status_code == 403 and is_manifest:
+                        logger.warning(f"⚠️ [curl_cffi] 403 on manifest, trying smart_request fallback for {final_curl_url[:50]}...")
+                        from utils.smart_request import smart_request
+                        sr_result = await smart_request("request.get", final_curl_url, headers=curl_headers)
+                        if sr_result.get("html"):
+                            logger.info("✅ [smart_request] Fallback success for manifest content")
+                            # Mock a response object that looks like what the rest of the code expects
+                            class MockSRResp:
+                                def __init__(self, content):
+                                    self.status = 200
+                                    self.headers = {"Content-Type": "application/vnd.apple.mpegurl"}
+                                    self.url = yarl.URL(final_curl_url)
+                                    self._content = content.encode('utf-8')
+                                async def read(self): return self._content
+                                async def text(self, **kwargs): return self._content.decode('utf-8')
+                                async def close(self): pass
+                                async def __aenter__(self): return self
+                                async def __aexit__(self, *args): pass
+                            
+                            resp_ctx = MockSRResp(sr_result["html"])
+                            goto_manifest_processing = True
+                        else:
+                            # Fallback failed too, use original curl_resp
+                            resp_ctx = MockResp(curl_resp)
+                            goto_manifest_processing = True
+                    else:
+                        resp_ctx = MockResp(curl_resp)
+                        goto_manifest_processing = True
+                except Exception as e:
+                    logger.error(f"❌ [curl_cffi] Error: {e}")
+                    goto_manifest_processing = False
             else:
-                resp_ctx = session.get(stream_url, headers=headers, ssl=not disable_ssl)
+                goto_manifest_processing = False
+
+            if not goto_manifest_processing:
+                if is_cccdn_stream:
+                    request_target = urllib.parse.unquote(stream_url)
+                else:
+                    request_target = yarl.URL(stream_url, encoded=True)
+                resp_ctx = session.get(request_target, headers=headers, ssl=not disable_ssl)
 
             async with resp_ctx as resp:
-                content_type = resp.headers.get("content-type", "")
+                content_type = resp.headers.get("content-type", "").lower()
 
-                # ✅ FIX: Se la risposta non è OK, restituisci direttamente l'errore senza processare
                 if resp.status not in [200, 206]:
-                    error_body = await resp.read()
-                    
-                    # DoodStream CDNs often report a 416 when VLC probes the end of file.
-                    # If it's benign (video still works), we silence it below WARNING level.
-                    is_dood_416 = resp.status == 416 and "cloudatacdn.com" in stream_url
-                    
-                    if is_dood_416:
-                        logger.debug(f"ℹ️ DoodStream 416 (benign/range-end): {stream_url}")
-                    else:
-                        logger.warning(
-                            f"⚠️ Upstream returned error {resp.status} for {stream_url}"
+                    if is_cccdn_stream and resp.status == 403 and not goto_manifest_processing:
+                        retry_result = await self._retry_cccdn_request(
+                            request_target,
+                            headers,
+                            disable_ssl,
                         )
-                    return web.Response(
-                        body=error_body,
-                        status=resp.status,
-                        headers={
-                            "Content-Type": content_type,
-                            "Access-Control-Allow-Origin": "*",
-                        },
-                    )
-
-                # Gestione special per manifest HLS
-                # ✅ AGGIORNATO: Prima leggi il body, poi decidi se è un manifest
-                # DLStreams invia i manifest come 'text/txt' o 'text/css', quindi
-                # non possiamo fidarci del Content-Type. Usiamo il signature '#EXTM3U'.
+                        if retry_result:
+                            retry_headers = dict(retry_result["headers"])
+                            retry_headers["Access-Control-Allow-Origin"] = "*"
+                            logger.info(
+                                "✅ cccdn retry success via alternate route: %s",
+                                retry_result["proxy"],
+                            )
+                            return web.Response(
+                                body=retry_result["body"],
+                                status=retry_result["status"],
+                                headers=retry_headers,
+                            )
+                    error_body = await resp.read()
+                    routing = "WARP" if (session_proxy and WARP_PROXY_URL and session_proxy == WARP_PROXY_URL) else ("BYPASS" if session_proxy is None else "PROXY")
+                    logger.warning(f"⚠️ Upstream returned error {resp.status} for {stream_url} [Routing: {routing}]")
+                    return web.Response(body=error_body, status=resp.status, headers={"Content-Type": content_type, "Access-Control-Allow-Origin": "*"})
 
                 is_direct_media_stream = request.path == "/proxy/stream" and (
-                    "video/" in content_type.lower()
-                    or stream_url.lower().endswith((".mp4", ".mkv", ".avi", ".mov"))
+                    "video/" in content_type or stream_url.lower().endswith((".mp4", ".mkv", ".avi", ".mov"))
                 )
+
                 if is_direct_media_stream:
-                    response_headers = {}
-                    # Filtriamo etag e last-modified per evitare che il client (VLC) 
-                    # mandi If-Match/If-Modified-Since nelle richieste successive.
-                    for header in [
-                        "content-type",
-                        "content-length",
-                        "content-range",
-                        "accept-ranges",
-                        # "last-modified", # RIMOSSO
-                        # "etag",          # RIMOSSO
-                    ]:
-                        if header in resp.headers:
-                            response_headers[header] = resp.headers[header]
+                    response_headers = {
+                        "Content-Type": content_type,
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+                        "Access-Control-Allow-Headers": "Range, Content-Type",
+                    }
+                    for h in ["content-length", "content-range", "accept-ranges"]:
+                        if h in resp.headers: response_headers[h] = resp.headers[h]
 
-                    set_response_header(
-                        response_headers, "Access-Control-Allow-Origin", "*"
-                    )
-                    set_response_header(
-                        response_headers,
-                        "Access-Control-Allow-Methods",
-                        "GET, HEAD, OPTIONS",
-                    )
-                    set_response_header(
-                        response_headers,
-                        "Access-Control-Allow-Headers",
-                        "Range, Content-Type",
-                    )
-
-                    response = web.StreamResponse(
-                        status=resp.status, headers=response_headers
-                    )
+                    response = web.StreamResponse(status=resp.status, headers=response_headers)
                     await response.prepare(request)
+                    try:
+                        async for chunk in resp.content.iter_any():
+                            await response.write(chunk)
+                        await response.write_eof()
+                        return response
+                    except (ClientPayloadError, ConnectionResetError, OSError) as e:
+                        logger.info(
+                            "Stream relay interrupted for %s [%s]: %s",
+                            stream_url,
+                            type(e).__name__,
+                            e,
+                        )
+                        return response
+                    except Exception as e:
+                        if "Connection lost" not in str(e) and "closing transport" not in str(e):
+                            logger.error(
+                                "❌ Stream error [%s]: %r",
+                                type(e).__name__,
+                                e,
+                            )
+                        return response
 
-                    async for chunk in resp.content.iter_chunked(8192):
-                        await response.write(chunk)
-                    await response.write_eof()
-                    return response
-                
                 content_bytes = await resp.read()
-                
-                # Prova a decodificare come testo per controllare la firma
                 manifest_content = None
                 try:
-                    decoded_text = content_bytes.decode("utf-8")
-                    # Controllo firma HLS: è un manifest se inizia con #EXTM3U
+                    decoded_text = content_bytes.decode("utf-8", errors='replace')
                     if decoded_text.lstrip().startswith("#EXTM3U"):
                         manifest_content = decoded_text
-                except UnicodeDecodeError:
-                    pass  # È binario, non è un manifest
-                
-                # Fallback: controlla anche il content-type standard per m3u8
-                if manifest_content is None:
-                    is_hls_manifest_by_type = "mpegurl" in content_type or stream_url.endswith(".m3u8")
-                    if is_hls_manifest_by_type:
-                        try:
-                            manifest_content = content_bytes.decode("utf-8")
-                        except UnicodeDecodeError:
-                            logger.warning(f"⚠️ Binary detected in {stream_url} (masked as {content_type}). Serving as binary.")
-                            return web.Response(
-                                body=content_bytes,
-                                status=resp.status,
-                                headers={
-                                    "Content-Type": "video/MP2T",
-                                    "Access-Control-Allow-Origin": "*",
-                                },
-                            )
+                except: pass
 
-                if manifest_content is None and request.path.startswith("/proxy/hls/segment."):
-                    segment_was_stripped = False
-                    if request.path.endswith(".ts") or stream_url.endswith(".ts"):
-                        original_len = len(content_bytes)
-                        content_bytes = self._strip_fake_png_header_from_ts(content_bytes)
-                        segment_was_stripped = len(content_bytes) != original_len
-                    segment_content_type = "video/mp4"
-                    if request.path.endswith(".ts"):
-                        segment_content_type = "video/MP2T"
+                if manifest_content is None and (".m3u8" in stream_url or "mpegurl" in content_type):
+                    try: manifest_content = content_bytes.decode("utf-8", errors='replace')
+                    except: pass
 
-                    response_headers = {
-                        "Content-Type": segment_content_type,
-                        "Access-Control-Allow-Origin": "*",
-                    }
-                    if "content-length" in resp.headers:
-                        response_headers["Content-Length"] = resp.headers["content-length"]
-                    if "content-range" in resp.headers:
-                        response_headers["Content-Range"] = resp.headers["content-range"]
-                    if "accept-ranges" in resp.headers:
-                        response_headers["Accept-Ranges"] = resp.headers["accept-ranges"]
-                    if segment_was_stripped:
-                        response_headers["Content-Length"] = str(len(content_bytes))
-                        response_headers.pop("Content-Range", None)
-                        response_headers.pop("Accept-Ranges", None)
-
-                    return web.Response(
-                        body=content_bytes,
-                        status=resp.status,
-                        headers=response_headers,
-                    )
-                
-                if manifest_content is not None:
-                    # È un manifest HLS — riscrivilo
-                    logger.info(f"📄 HLS manifest detected for: {stream_url} (Content-Type: {content_type})")
-
-                    # ✅ CORREZIONE: Rileva lo schema e l'host corretti quando dietro un reverse proxy
+                if manifest_content:
+                    logger.info(f"📄 HLS manifest detected: {stream_url}")
                     scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
                     host = request.headers.get("X-Forwarded-Host", request.host)
                     proxy_base = f"{scheme}://{host}"
-                    original_channel_url = request.query.get("url") or request.query.get("d", "")
-
-                    api_password = request.query.get("api_password")
-                    no_bypass = request.query.get("no_bypass") == "1"
-
-                    # Use the final URL after redirects as the base for rewriting relative paths
-                    final_stream_url = str(resp.url)
-
-                    rewritten_manifest = await ManifestRewriter.rewrite_manifest_urls(
-                        manifest_content,
-                        final_stream_url,
-                        proxy_base,
-                        headers,
-                        original_channel_url,
-                        api_password,
-                        self.get_extractor,
-                        no_bypass,
+                    original_url = request.query.get("url") or request.query.get("d", "")
+                    use_short_hls_urls = (
+                        "cinemacity.cc" in (original_url or "").lower()
+                        or request.query.get("host", "").lower() in {"city", "cinemacity"}
+                        or "cccdn.net" in str(resp.url).lower()
                     )
-
-                    return web.Response(
-                        text=rewritten_manifest,
-                        headers={
-                            "Content-Type": "application/vnd.apple.mpegurl",
-                            "Content-Disposition": 'attachment; filename="stream.m3u8"',
-                            "Access-Control-Allow-Origin": "*",
-                            "Cache-Control": "no-cache",
-                        },
+                    
+                    rewritten = await ManifestRewriter.rewrite_manifest_urls(
+                        manifest_content=manifest_content,
+                        base_url=str(resp.url),
+                        proxy_base=proxy_base,
+                        stream_headers=headers,
+                        original_channel_url=original_url,
+                        api_password=request.query.get("api_password"),
+                        get_extractor_func=self.get_extractor,
+                        no_bypass=request.query.get("no_bypass") == "1",
+                        shorten_url_func=self.shorten_hls_url if use_short_hls_urls else None
                     )
+                    return web.Response(text=rewritten, headers={
+                        "Content-Type": "application/vnd.apple.mpegurl",
+                        "Access-Control-Allow-Origin": "*",
+                        "Cache-Control": "no-cache",
+                    })
                 
                 # ✅ AGGIORNATO: Gestione per manifest MPD (DASH) - separate block
                 if manifest_content is None and ("dash+xml" in content_type or stream_url.endswith(".mpd")):
@@ -2418,7 +2867,7 @@ class HLSProxy:
                                     clearkey_param = ",".join(clearkey_parts)
 
                     # --- LEGACY MODE: MPD -> HLS Conversion ---
-                    if MPD_MODE == "legacy" and MPDToHLSConverter:
+                    if MPD_MODE in ("legacy", "none", "disabled") and MPDToHLSConverter:
                         logger.info(
                             f"🔄 [Legacy Mode] Converting MPD to HLS for {stream_url}"
                         )
@@ -2439,7 +2888,7 @@ class HLSProxy:
                                     clearkey_param,
                                 )
                                 # Log first few lines for debugging
-                                logger.info(
+                                logger.debug(
                                     f"📜 Generated Media Playlist for {rep_id} (first 10 lines):\n{chr(10).join(hls_playlist.splitlines()[:10])}"
                                 )
                             else:
@@ -2450,7 +2899,7 @@ class HLSProxy:
                                     stream_url,
                                     request.query_string,
                                 )
-                                logger.info(
+                                logger.debug(
                                     f"📜 Generated Master Playlist (first 5 lines):\n{chr(10).join(hls_playlist.splitlines()[:5])}"
                                 )
 
@@ -2458,7 +2907,6 @@ class HLSProxy:
                                 text=hls_playlist,
                                 headers={
                                     "Content-Type": "application/vnd.apple.mpegurl",
-                                    "Content-Disposition": 'attachment; filename="stream.m3u8"',
                                     "Access-Control-Allow-Origin": "*",
                                     "Cache-Control": "no-cache",
                                 },
@@ -2513,13 +2961,21 @@ class HLSProxy:
                     if header in resp.headers:
                         response_headers[header] = resp.headers[header]
 
-                # ✅ FIX: Forza Content-Type per segmenti .ts se il server non lo invia correttamente
+                # ✅ FIX: Forza Content-Type coerente se il server non lo invia correttamente
                 if (
                     stream_url.endswith(".ts") or request.path.endswith(".ts")
                 ) and "video/mp2t" not in response_headers.get(
                     "content-type", ""
                 ).lower():
                     set_response_header(response_headers, "Content-Type", "video/MP2T")
+                elif (
+                    stream_url.endswith(".vtt")
+                    or stream_url.endswith(".webvtt")
+                    or request.path.endswith(".vtt")
+                ) and "text/vtt" not in response_headers.get(
+                    "content-type", ""
+                ).lower():
+                    set_response_header(response_headers, "Content-Type", "text/vtt; charset=utf-8")
                 if segment_was_stripped:
                     set_response_header(
                         response_headers, "Content-Length", str(len(content_bytes))
@@ -2543,8 +2999,10 @@ class HLSProxy:
                     "Range, Content-Type",
                 )
 
-                # Override content-length with actual bytes read
-                response_headers["Content-Length"] = str(len(content_bytes))
+                # Override content-length with actual bytes read, evitando duplicati case-insensitive
+                set_response_header(
+                    response_headers, "Content-Length", str(len(content_bytes))
+                )
                 
                 return web.Response(
                     body=content_bytes,
@@ -2568,8 +3026,17 @@ class HLSProxy:
             return web.Response(text=f"Upstream connection lost: {str(e)}", status=502)
 
         except Exception as e:
-            logger.error(f"❌ Generic error in stream proxy: {str(e)}")
-            return web.Response(text=f"Stream error: {str(e)}", status=500)
+            err_msg = str(e)
+            if "Connection lost" in err_msg or "Connection reset" in err_msg:
+                logger.info(f"ℹ️ Stream connection closed by client or server: {stream_url}")
+                return web.Response(text="Connection lost", status=499)
+            
+            logger.error(
+                "❌ Generic error in stream proxy [%s]: %r",
+                type(e).__name__,
+                e,
+            )
+            return web.Response(text=f"Stream error: {err_msg}", status=500)
 
     async def handle_playlist_request(self, request):
         """Gestisce le richieste per il playlist builder"""
@@ -2644,7 +3111,20 @@ class HLSProxy:
     async def handle_root(self, request):
         """Serve la pagina principale index.html."""
         try:
+            # Refresh version on each page load
+            await self._refresh_latest_version()
+            
             html_content = self._read_template("index.html")
+            
+            # Determine version status class
+            is_outdated = self.latest_version not in ["Checking...", "Unknown", "Error", APP_VERSION]
+            version_status_class = "outdated" if is_outdated else ""
+
+            html_content = html_content.replace("{{VERSION_MODE}}", VERSION_MODE)
+            html_content = html_content.replace("{{APP_VERSION}}", APP_VERSION)
+            html_content = html_content.replace("{{LATEST_VERSION}}", self.latest_version)
+            html_content = html_content.replace("{{VERSION_STATUS_CLASS}}", version_status_class)
+            html_content = html_content.replace("{{WARP_STATUS}}", self.warp_status)
             return web.Response(text=html_content, content_type="text/html")
         except Exception as e:
             logger.error(f"❌ Critical error: unable to load 'index.html': {e}")
@@ -2709,7 +3189,20 @@ class HLSProxy:
     async def handle_info_page(self, request):
         """Serve la pagina HTML delle informazioni."""
         try:
+            # Refresh version on each page load
+            await self._refresh_latest_version()
+            
             html_content = self._read_template("info.html")
+
+            # Determine version status class
+            is_outdated = self.latest_version not in ["Checking...", "Unknown", "Error", APP_VERSION]
+            version_status_class = "outdated" if is_outdated else ""
+
+            html_content = html_content.replace("{{VERSION_MODE}}", VERSION_MODE)
+            html_content = html_content.replace("{{APP_VERSION}}", APP_VERSION)
+            html_content = html_content.replace("{{LATEST_VERSION}}", self.latest_version)
+            html_content = html_content.replace("{{VERSION_STATUS_CLASS}}", version_status_class)
+            html_content = html_content.replace("{{WARP_STATUS}}", self.warp_status)
             return web.Response(text=html_content, content_type="text/html")
         except Exception as e:
             logger.error(f"❌ Critical error: unable to load 'info.html': {e}")
@@ -2739,9 +3232,13 @@ class HLSProxy:
 
     async def handle_api_info(self, request):
         """Endpoint API che restituisce le informazioni sul server in formato JSON."""
+        # Refresh version on API call
+        await self._refresh_latest_version()
+        
         info = {
             "proxy": "HLS Proxy Server",
-            "version": "2.5.0",  # Aggiornata per supporto AES-128
+            "version": APP_VERSION,  # Aggiornata per supporto AES-128
+            "mode": VERSION_MODE,
             "status": "✅ Running",
             "features": [
                 "✅ Proxy HLS streams",
@@ -3064,7 +3561,10 @@ class HLSProxy:
             if decrypt_segment is None:
                 return
 
-            session = await self._get_session()
+            # Ensure dynamic WARP bypass for prefetch
+            self._check_dynamic_warp_bypass(url)
+            
+            session = await self._get_session(url=url)
 
             # Download Init (usa cache se possibile)
             init_content = b""
@@ -3130,10 +3630,6 @@ class HLSProxy:
                 "-c",
                 "copy",
                 "-copyts",  # Preserve timestamps to prevent freezing/gap issues
-                "-bsf:v",
-                "h264_mp4toannexb",  # Ensure video is Annex B (MPEG-TS requirement)
-                "-bsf:a",
-                "aac_adtstoasc",  # Ensure audio is ADTS (MPEG-TS requirement)
                 "-f",
                 "mpegts",
                 "pipe:1",
@@ -3182,7 +3678,7 @@ class HLSProxy:
 
         if decrypt_segment is None:
             return web.Response(
-                text="Decrypt not available (MPD_MODE is not legacy)", status=503
+                text="Decrypt not available (MPD_MODE is ffmpeg or disabled)", status=503
             )
 
         # Check cache first
@@ -3297,16 +3793,20 @@ class HLSProxy:
                     None, decrypt_segment, init_content, segment_content, key_id, key
                 )
 
-            # Leggero REMUX to TS
-            ts_content = await self._remux_to_ts(combined_content)
-            if not ts_content:
-                logger.warning("⚠️ Remux failed, serving raw fMP4")
-                # Fallback: serve fMP4 if remux fails
+            # Leggero REMUX to TS (if enabled)
+            if ENABLE_REMUXING:
+                ts_content = await self._remux_to_ts(combined_content)
+                if not ts_content:
+                    logger.warning("⚠️ Remux failed, serving raw fMP4")
+                    ts_content = combined_content
+                    content_type = "video/mp4"
+                else:
+                    content_type = "video/MP2T"
+                    logger.info("⚡ Remuxed fMP4 -> TS")
+            else:
+                logger.debug("⏩ Remuxing disabled, serving raw fMP4")
                 ts_content = combined_content
                 content_type = "video/mp4"
-            else:
-                content_type = "video/MP2T"
-                logger.info("⚡ Remuxed fMP4 -> TS")
 
             # Store in cache
             self.segment_cache[cache_key] = (ts_content, time.time())
@@ -3465,6 +3965,12 @@ class HLSProxy:
                 if session and not session.closed:
                     await session.close()
             self.proxy_sessions.clear()
+
+            # Close all cached curl sessions
+            for session in list(self.curl_sessions.values()):
+                if session:
+                    await session.close()
+            self.curl_sessions.clear()
 
             for extractor in self.extractors.values():
                 if hasattr(extractor, "close"):
