@@ -227,8 +227,10 @@ class DoodStreamExtractor:
     async def _do_extract_with_proxy(self, embed_url: str, scraper_proxies: dict | None) -> dict | None:
         scraper = cloudscraper.create_scraper(delay=5)
         if scraper_proxies:
+            self.last_used_proxy = scraper_proxies["https"]
             logger.info(f"DoodStream: cloudscraper using proxy {scraper_proxies['https']}")
         else:
+            self.last_used_proxy = None
             logger.info("DoodStream: cloudscraper using direct connection")
 
         response = await asyncio.to_thread(
