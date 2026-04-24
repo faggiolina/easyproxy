@@ -1,4 +1,5 @@
 import logging
+import socket
 import re
 import time
 import asyncio
@@ -8,6 +9,13 @@ import aiohttp
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 from yarl import URL
+
+from config import (
+    GLOBAL_PROXIES,
+    TRANSPORT_ROUTES,
+    get_proxy_for_url,
+    get_connector_for_proxy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -471,19 +479,38 @@ class DLStreamsExtractor:
                 return None
 
     async def _get_session(self):
-        if self.session is None or self.session.closed:
-            # DLStreams keys and segments appear to be tied to a consistent
-            # egress/session context. Using rotating/global proxies here can
-            # produce a different AES key than the browser receives.
-            connector = TCPConnector(limit=0, limit_per_host=0)
-            
-            timeout = ClientTimeout(total=30, connect=10)
-            self.session = ClientSession(
-                timeout=timeout,
-                connector=connector,
-                headers=self.base_headers,
-                cookie_jar=aiohttp.CookieJar(unsafe=True),
-            )
+        # Determine the correct proxy for the current state
+        proxy_url = get_proxy_for_url(self.entry_origin, TRANSPORT_ROUTES, self.proxies, bypass_warp=self.bypass_warp_active)
+        
+        # If we have an existing session, check if its proxy matches what we need now
+        if self.session and not self.session.closed:
+            # We store the proxy used for the current session in a custom attribute
+            session_proxy = getattr(self, "_session_proxy", "NOT_SET")
+            if session_proxy == proxy_url:
+                return self.session
+            else:
+                logger.debug("DLStreams: Proxy choice changed (was %s, now %s). Closing old session.", session_proxy, proxy_url)
+                await self.session.close()
+                self.session = None
+
+        # DLStreams keys and segments appear to be tied to a consistent
+        # egress/session context. Using rotating/global proxies here can
+        # produce a different AES key than the browser receives.
+        if proxy_url:
+            connector = get_connector_for_proxy(proxy_url)
+            logger.debug("DLStreams: Using proxy session: %s", proxy_url)
+        else:
+            connector = TCPConnector(limit=0, limit_per_host=0, family=socket.AF_INET)
+            logger.debug("DLStreams: Using direct session (Real IP)")
+        
+        timeout = ClientTimeout(total=30, connect=10)
+        self.session = ClientSession(
+            timeout=timeout,
+            connector=connector,
+            headers=self.base_headers,
+            cookie_jar=aiohttp.CookieJar(unsafe=True),
+        )
+        self._session_proxy = proxy_url # Store for future comparison
         return self.session
 
     async def extract(self, url: str, **kwargs) -> Dict[str, Any]:
@@ -493,8 +520,20 @@ class DLStreamsExtractor:
             # Extract ID from URL or use as is if numeric
             channel_id = self._extract_channel_id(url)
 
-            channel_key = f"premium{channel_id}"
-            session = await self._get_session()
+        # Respect bypass_warp or warp from kwargs if provided
+        target_warp = kwargs.get("bypass_warp") or kwargs.get("warp")
+        if target_warp is not None:
+            if isinstance(target_warp, str):
+                if target_warp.lower() == "off":
+                    self.bypass_warp_active = True
+                elif target_warp.lower() in ("on", "true", "1"):
+                    self.bypass_warp_active = False
+            else:
+                self.bypass_warp_active = bool(target_warp)
+            logger.debug(f"DLStreams: bypass_warp_active updated from kwargs to {self.bypass_warp_active}")
+
+        channel_key = f"premium{channel_id}"
+        session = await self._get_session()
             
             # Use cached session info if available to find server and origin
             iframe_origin = self.entry_origin.rstrip("/")
@@ -542,7 +581,7 @@ class DLStreamsExtractor:
                     "request_headers": playback_headers,
                     "mediaflow_endpoint": self.mediaflow_endpoint,
                     "captured_manifest": cached_item[0],
-                    "bypass_warp": True
+                    "bypass_warp": self.bypass_warp_active
                 }
 
             # 2. PROACTIVE BACKGROUND REFRESH
@@ -641,7 +680,7 @@ class DLStreamsExtractor:
                 "request_headers": playback_headers,
                 "mediaflow_endpoint": self.mediaflow_endpoint,
                 "captured_manifest": captured_manifest,
-                "bypass_warp": True
+                "bypass_warp": self.bypass_warp_active
             }
 
         except Exception as e:
