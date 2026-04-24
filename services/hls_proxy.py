@@ -1940,6 +1940,8 @@ class HLSProxy:
             selected_proxy = result.get("selected_proxy")
             bypass_warp = result.get("bypass_warp", bypass_warp)
             
+            logger.debug(f"Extractor Debug: Extractor result selected_proxy: {selected_proxy}")
+            
             # Log dello stato dell'estrattore
             logger.debug(f"Extractor Debug: Extractor result bypass_warp: {result.get('bypass_warp')}")
             

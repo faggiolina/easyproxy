@@ -16,14 +16,12 @@ from config import get_proxy_for_url, TRANSPORT_ROUTES, GLOBAL_PROXIES, get_conn
 
 logger = logging.getLogger(__name__)
 
-_FREE_PROXY_URL = os.environ.get(
-    "VIXSRC_FREE_PROXY_URL",
-    "https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/all/data.txt",
-)
-_FREE_PROXY_ENABLED = os.environ.get("VIXSRC_ENABLE_FREE_PROXY_POOL", "true").lower() == "true"
-_FREE_PROXY_CACHE_TTL = int(os.environ.get("VIXSRC_FREE_PROXY_CACHE_TTL", "1800"))
-_FREE_PROXY_MAX_FETCH = int(os.environ.get("VIXSRC_FREE_PROXY_MAX_FETCH", "80"))
-_FREE_PROXY_MAX_GOOD = int(os.environ.get("VIXSRC_FREE_PROXY_MAX_GOOD", "8"))
+_FREE_PROXY_MAX_FETCH = int(os.environ.get("VIXSRC_FREE_PROXY_MAX_FETCH", "0"))
+_FREE_PROXY_MAX_GOOD = int(os.environ.get("VIXSRC_FREE_PROXY_MAX_GOOD", "0"))
+
+from utils.proxy_manager import FreeProxyManager
+
+
 
 
 class ExtractorError(Exception):
@@ -32,10 +30,6 @@ class ExtractorError(Exception):
 
 class VixSrcExtractor:
     """VixSrc URL extractor per risolvere link VixSrc."""
-    _free_proxy_lock = threading.Lock()
-    _free_proxy_cache = {"expires_at": 0.0, "proxies": []}
-    _free_proxy_cursor = 0
-
     def __init__(self, request_headers: dict, proxies: list = None):
         self.request_headers = request_headers
         self.base_headers = self._default_headers()
@@ -44,6 +38,17 @@ class VixSrcExtractor:
         self._session_lock = asyncio.Lock()
         self.proxies = proxies or GLOBAL_PROXIES
         self.is_vixsrc = True
+        self.last_used_proxy = None
+        self.proxy_manager = FreeProxyManager.get_instance(
+            "vixsrc",
+            os.environ.get(
+                "VIXSRC_FREE_PROXY_URL",
+                "https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/all/data.txt",
+            ),
+            cache_ttl=int(os.environ.get("VIXSRC_FREE_PROXY_CACHE_TTL", "1800")),
+            max_fetch=_FREE_PROXY_MAX_FETCH,
+            max_good=_FREE_PROXY_MAX_GOOD,
+        )
 
     @staticmethod
     def _normalize_proxy_url(proxy_value: str) -> str:
@@ -105,80 +110,24 @@ class VixSrcExtractor:
             cookie_jar=aiohttp.CookieJar(),
         )
 
-    def _fetch_free_proxy_candidates(self) -> list[str]:
-        scraper = cloudscraper.create_scraper(delay=2)
-        resp = scraper.get(
-            _FREE_PROXY_URL,
-            headers={"User-Agent": self._default_headers()["user-agent"]},
-            timeout=20,
-        )
-        resp.raise_for_status()
-        proxies = []
-        for line in resp.text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            proxies.append(self._normalize_proxy_url(line))
-            if len(proxies) >= _FREE_PROXY_MAX_FETCH:
-                break
-        return proxies
-
-    def _probe_free_proxy(self, proxy_url: str, url: str, headers: dict) -> bool:
-        try:
-            scraper = cloudscraper.create_scraper(delay=2)
-            resp = scraper.get(
-                url,
-                headers=headers or self._default_headers(),
-                timeout=12,
-                proxies={"http": proxy_url, "https": proxy_url},
-            )
-            return resp.status_code == 200 and len(resp.text) > 100
-        except Exception:
-            return False
-
-    def _get_auto_proxy_pool(self, url: str, headers: dict) -> list[str]:
-        if not _FREE_PROXY_ENABLED:
+    async def _get_auto_proxy_pool(self, url: str, headers: dict) -> list[str]:
+        if os.environ.get("VIXSRC_ENABLE_FREE_PROXY_POOL", "true").lower() != "true":
             return []
 
-        now = time.time()
-        cached = self.__class__._free_proxy_cache
-        if cached["proxies"] and cached["expires_at"] > now:
-            return list(cached["proxies"])
-
-        with self.__class__._free_proxy_lock:
-            cached = self.__class__._free_proxy_cache
-            if cached["proxies"] and cached["expires_at"] > time.time():
-                return list(cached["proxies"])
-
-            logger.info("VixSrc: refreshing free proxy pool after direct 403")
+        def probe_sync(proxy_url: str) -> bool:
             try:
-                candidates = self._fetch_free_proxy_candidates()
-            except Exception as exc:
-                logger.warning("VixSrc: free proxy list fetch failed: %s", exc)
-                return list(cached["proxies"])
+                scraper = cloudscraper.create_scraper(delay=2)
+                resp = scraper.get(
+                    url,
+                    headers=headers or self._default_headers(),
+                    timeout=12,
+                    proxies={"http": proxy_url, "https": proxy_url},
+                )
+                return resp.status_code == 200 and len(resp.text) > 100
+            except Exception:
+                return False
 
-            good = []
-            for proxy_url in candidates:
-                if self._probe_free_proxy(proxy_url, url, headers):
-                    good.append(proxy_url)
-                    logger.info("VixSrc: free proxy validated %s", proxy_url)
-                if len(good) >= _FREE_PROXY_MAX_GOOD:
-                    break
-
-            self.__class__._free_proxy_cache = {
-                "expires_at": time.time() + _FREE_PROXY_CACHE_TTL,
-                "proxies": good,
-            }
-            return list(good)
-
-    def _get_next_auto_proxy_sequence(self, url: str, headers: dict) -> list[str]:
-        proxies = self._get_auto_proxy_pool(url, headers)
-        if not proxies:
-            return []
-        with self.__class__._free_proxy_lock:
-            cursor = self.__class__._free_proxy_cursor % len(proxies)
-            self.__class__._free_proxy_cursor = (cursor + 1) % len(proxies)
-        return proxies[cursor:] + proxies[:cursor]
+        return await self.proxy_manager.get_next_sequence(probe_sync)
 
     @staticmethod
     def _raise_if_embed_expired(url: str):
@@ -209,6 +158,7 @@ class VixSrcExtractor:
                 proxy = self._get_random_proxy()
             if proxy:
                 proxy = self._normalize_proxy_url(proxy)
+                self.last_used_proxy = proxy
             self.session = self._build_session_for_proxy(proxy)
         return self.session
 
@@ -289,7 +239,7 @@ class VixSrcExtractor:
                             pass
                         self.session = None
 
-                    for proxy_url in self._get_next_auto_proxy_sequence(url, final_headers):
+                    for proxy_url in await self._get_auto_proxy_pool(url, final_headers):
                         logger.info("VixSrc: retrying with auto proxy %s", proxy_url)
                         temp_session = None
                         try:
@@ -308,6 +258,7 @@ class VixSrcExtractor:
                                         self.text = text_content
 
                                 self.session = temp_session
+                                self.last_used_proxy = proxy_url
                                 logger.info("VixSrc: free proxy fallback succeeded with %s", proxy_url)
                                 return MockResponse(content, response.status, response.headers, response.url)
                         except Exception as proxy_exc:
@@ -503,10 +454,14 @@ class VixSrcExtractor:
 
             if "/playlist/" in parsed_url.path:
                 logger.info("URL is already a VixSrc manifest, no extraction required.")
+                # Preserve selected_proxy from query if present
+                selected_proxy = kwargs.get("proxy") or parse_qs(parsed_url.query).get("proxy", [None])[0]
+                logger.debug(f"Extractor Debug: Extractor result selected_proxy: {selected_proxy}")
                 return {
                     "destination_url": url,
                     "request_headers": self._fresh_headers(),
                     "mediaflow_endpoint": self.mediaflow_endpoint,
+                    "selected_proxy": selected_proxy or self.last_used_proxy,
                 }
 
             if "/embed/" in parsed_url.path:
@@ -566,6 +521,7 @@ class VixSrcExtractor:
                     "destination_url": final_url,
                     "request_headers": stream_headers,
                     "mediaflow_endpoint": self.mediaflow_endpoint,
+                    "selected_proxy": self.last_used_proxy,
                 }
             except Exception as e:
                 raise ExtractorError(f"JavaScript script parsing error: {e}")
