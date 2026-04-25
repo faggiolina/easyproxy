@@ -1,7 +1,10 @@
+import logging
 import re
 from urllib.parse import urljoin, urlparse
 from extractors.base import BaseExtractor, ExtractorError
 from utils.packed import unpack
+
+logger = logging.getLogger(__name__)
 
 class StreamHGExtractor(BaseExtractor):
     """Extractor for StreamHG-style players (dhcplay/vibuxer mirrors)."""
