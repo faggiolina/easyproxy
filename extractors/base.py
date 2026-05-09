@@ -3,7 +3,7 @@ import asyncio
 import random
 import aiohttp
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, ClientConnectionError
-from aiohttp_socks import ProxyConnector, ProxyError as AioProxyError
+from aiohttp_socks import ProxyError as AioProxyError
 from python_socks import ProxyError as PyProxyError
 
 from config import (
@@ -11,9 +11,9 @@ from config import (
     TRANSPORT_ROUTES, 
     get_connector_for_proxy,
     SELECTED_PROXY_CONTEXT,
-    GLOBAL_PROXIES
+    GLOBAL_PROXIES,
+    mark_proxy_dead
 )
-from utils.proxy_manager import FreeProxyManager
 
 logger = logging.getLogger(__name__)
 
@@ -33,14 +33,6 @@ class BaseExtractor:
         self.proxies = proxies or GLOBAL_PROXIES
         self.extractor_name = extractor_name
         
-        # Initialize FreeProxyManager for this extractor
-        self.proxy_manager = FreeProxyManager.get_instance(
-            extractor_name,
-            [
-                "https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/all/data.txt",
-                "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text"
-            ]
-        )
 
     async def _get_session(self, url: str = None):
         if self.session is None or self.session.closed:
@@ -81,6 +73,16 @@ class BaseExtractor:
                 session = await self._get_session(url)
                 async with session.request(method, url, headers=final_headers, allow_redirects=True, **kwargs) as response:
                     response.raise_for_status()
+                    
+                    # ✅ NUOVO: Protezione contro file binari giganti
+                    content_type = response.headers.get("Content-Type", "").lower()
+                    content_length = int(response.headers.get("Content-Length", 0))
+                    
+                    if "video/" in content_type or "audio/" in content_type or content_length > 2 * 1024 * 1024:
+                        logger.warning(f"[{self.extractor_name}] Skipping text read for binary/large content: {content_type} ({content_length} bytes)")
+                        # Restituisci un MockResponse "vuoto" o che indica il bypass
+                        return MockResponse("", response.status, response.headers, str(response.url), response.cookies)
+
                     content = await response.text()
                     
                     class MockResponse:
@@ -106,8 +108,6 @@ class BaseExtractor:
                 
                 # Check for 403 or network errors to trigger fallback
                 status = getattr(e, 'status', None)
-                should_fallback = is_proxy_err or is_timeout or status in (403, 502, 503, 504)
-                
                 logger.warning(f"[{self.extractor_name}] Attempt {attempt+1} failed for {url}: {e}")
                 
                 # Reset session
@@ -116,21 +116,10 @@ class BaseExtractor:
                 self.session = None
                 
                 if is_proxy_err and SELECTED_PROXY_CONTEXT.get():
+                    proxy_to_mark = SELECTED_PROXY_CONTEXT.get()
+                    if proxy_to_mark and "127.0.0.1" in proxy_to_mark:
+                        mark_proxy_dead(proxy_to_mark)
                     SELECTED_PROXY_CONTEXT.set(None)
-                
-                if should_fallback and attempt == 0:
-                    logger.info(f"[{self.extractor_name}] Trying free proxy fallback for {url}")
-                    for proxy_url in await self.proxy_manager.get_proxies():
-                        try:
-                            connector = ProxyConnector.from_url(proxy_url)
-                            async with ClientSession(connector=connector, timeout=ClientTimeout(total=20)) as fallback_session:
-                                async with fallback_session.request(method, url, headers=final_headers, allow_redirects=True, **kwargs) as resp:
-                                    if resp.status == 200:
-                                        logger.info(f"[{self.extractor_name}] Fallback successful via {proxy_url}")
-                                        content = await resp.text()
-                                        return MockResponse(content, resp.status, resp.headers, str(resp.url), resp.cookies)
-                        except Exception:
-                            continue
                 
                 if attempt < retries - 1:
                     await asyncio.sleep(1)
